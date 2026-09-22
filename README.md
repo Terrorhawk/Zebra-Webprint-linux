@@ -61,25 +61,26 @@ sudo openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
   -keyout /etc/ssl/private/zebra-key.pem \
   -out /etc/ssl/certs/zebra-cert.pem \
   -subj "/CN=localhost"
+```
 
 3. Script plaatsen
 
 Download zebra_bridge.py en plaats deze in /usr/local/bin/:
 Bash
-
+```bash
 sudo cp zebra_bridge.py /usr/local/bin/zebra_bridge.py
 sudo chmod +x /usr/local/bin/zebra_bridge.py
-
+```
 ⚙️ Automatisch starten als Systemd Service
 
 Maak een systemd service-bestand aan om de bridge automatisch te laten starten bij het opstarten van het systeem:
 Bash
-
+```bash
 sudo nano /etc/systemd/system/zebra-bridge.service
-
+```
 Plak de volgende inhoud in het bestand:
 Ini, TOML
-
+```bash
 [Unit]
 Description=Zebra WebPrint Browser Print Bridge Service
 After=network.target cups.service
@@ -94,26 +95,26 @@ RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-
+```
 Herlaad systemd, activeer de service en start deze op:
 Bash
-
+```bash
 sudo systemctl daemon-reload
 sudo systemctl enable zebra-bridge.service
 sudo systemctl start zebra-bridge.service
-
+```
 Controleer de status van de service:
 Bash
-
+```bash
 sudo systemctl status zebra-bridge.service
-
+```
 🔍 Logboeken inzien
 
 Je kunt de realtime verzoeken en printer-statuspeilingen bekijken via journalctl:
 Bash
-
+```bash
 sudo journalctl -u zebra-bridge.service -f
-
+```
 📄 Licentie
 
 Dit project is beschikbaar onder de MIT-licentie. Voel je vrij om dit script aan te passen, te verbeteren of uit te breiden voor jouw specifieke toepassingen!
