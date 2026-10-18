@@ -18,7 +18,8 @@ import select
 import socket
 import re
 
-LAST_READ_BUFFER = b""
+READ_BUFFERS = {}
+READ_LOCK = threading.Lock()
 
 def parse_has_hardware_error(response_bytes):
     """Controleert of de printerrespons hardwarefouten bevat."""
@@ -138,137 +139,134 @@ class ZebraHandler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
 
+    def _reply(self, status, value=b'', content_type='application/json'):
+        body = json.dumps(value).encode('utf-8') if isinstance(value, (dict, list)) else value
+        self.send_response(status)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(body)))
+        self._send_cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_OPTIONS(self):
-        try:
-            self.send_response(200)
-            self._send_cors_headers()
-            self.end_headers()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        self._reply(200)
 
     def get_printers(self):
         printers = []
         try:
-            output = subprocess.check_output(['lpstat', '-a'], text=True)
-            for line in output.strip().split('\n'):
-                if line:
-                    name = line.split()[0]
-                    name_lower = name.lower()
-                    if 'zebra' in name_lower or 'hc100' in name_lower:
-                        printers.append({
-                            "name": name,
-                            "deviceType": "printer",
-                            "connection": "network",
-                            "uid": name,
-                            "provider": "cups",
-                            "manufacturer": "Zebra Technologies"
-                        })
-        except Exception:
+            output = subprocess.check_output(['lpstat', '-a'], text=True, timeout=5)
+            for line in output.strip().splitlines():
+                if not line.strip():
+                    continue
+                name = line.split()[0]
+                if 'zebra' in name.lower() or 'hc100' in name.lower():
+                    printers.append({'name': name, 'deviceType': 'printer', 'connection': 'network',
+                                     'uid': name, 'provider': 'cups', 'manufacturer': 'Zebra Technologies'})
+        except (OSError, subprocess.SubprocessError):
             pass
         return printers
 
-    def do_GET(self):
-        global LAST_READ_BUFFER
-        parsed_path = urllib.parse.urlparse(self.path)
-        path = parsed_path.path
-
+    def _select_printer(self, payload=None):
+        printers = self.get_printers()
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        device = (payload or {}).get('device', {})
+        if not isinstance(device, dict):
+            raise ValueError('Invalid device')
+        requested = device.get('uid') or device.get('name') or query.get('device', query.get('uid', [None]))[0]
+        if requested:
+            return next((p for p in printers if p['uid'] == requested or p['name'] == requested), None)
         try:
-            if path in ['/available', '/default', '/']:
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self._send_cors_headers()
-                self.end_headers()
-                printers = self.get_printers()
-                self.wfile.write(json.dumps({"printer": printers}).encode('utf-8'))
-
-            elif path in ['/read', '/read/']:
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/plain')
-                self._send_cors_headers()
-                self.end_headers()
-                self.wfile.write(LAST_READ_BUFFER)
-
-            else:
-                self.send_response(404)
-                self.end_headers()
-        except (BrokenPipeError, ConnectionResetError):
+            default = subprocess.check_output(['lpstat', '-d'], text=True, timeout=5).strip().split(':', 1)[-1].strip()
+            chosen = next((p for p in printers if p['uid'] == default), None)
+            if chosen:
+                return chosen
+        except (OSError, subprocess.SubprocessError):
             pass
+        return printers[0] if printers else None
+
+    def _body(self):
+        length = int(self.headers.get('Content-Length', '0'))
+        if length < 0 or length > 1024 * 1024:
+            raise ValueError('Invalid request size')
+        raw = self.rfile.read(length)
+        if not raw:
+            return {}, b''
+        try:
+            payload = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            if self.headers.get_content_type() == 'application/json':
+                raise ValueError('Invalid JSON')
+            return {}, raw
+        if not isinstance(payload, dict):
+            raise ValueError('Invalid payload')
+        return payload, raw
+
+    def _read_status(self, payload=None):
+        printer = self._select_printer(payload)
+        if not printer:
+            self._reply(404, {'error': 'Printer not available'})
+            return
+        with READ_LOCK:
+            status = READ_BUFFERS.pop(printer['uid'], b'')
+        self._reply(200, status, 'text/plain')
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path.rstrip('/') or '/'
+        if path in ['/available', '/']:
+            self._reply(200, {'printer': self.get_printers()})
+        elif path == '/default':
+            printer = self._select_printer()
+            # The SDK expects a single device object, or an empty body for no default.
+            self._reply(200, printer if printer else b'')
+        elif path == '/read':
+            self._read_status()
+        else:
+            self._reply(404)
 
     def do_POST(self):
-        global LAST_READ_BUFFER
-        parsed_path = urllib.parse.urlparse(self.path)
-        path = parsed_path.path
-
         try:
-            if path in ['/write', '/write/', '/']:
-                content_length = int(self.headers.get('Content-Length', 0))
-                raw_post_data = self.rfile.read(content_length)
-
-                zpl_bytes = raw_post_data
-                try:
-                    json_payload = json.loads(raw_post_data.decode('utf-8', errors='ignore'))
-                    if isinstance(json_payload, dict) and 'data' in json_payload:
-                        zpl_bytes = json_payload['data'].encode('utf-8', errors='ignore')
-                except Exception:
-                    pass
-
-                clean_data = zpl_bytes.strip()
-
-                qs = urllib.parse.parse_qs(parsed_path.query)
-                printer_name = None
-                if 'device' in qs:
-                    printer_name = qs['device'][0]
-                elif 'uid' in qs:
-                    printer_name = qs['uid'][0]
-                if not printer_name:
-                    printers = self.get_printers()
-                    printer_name = printers[0]['name'] if printers else "Zebra1"
-
-                status_queries = [b'~HQES', b'~HS', b'~HI', b'~HD']
-                is_status_query = False
-                if len(clean_data) < 100 and b'^XA' not in clean_data:
-                    if any(clean_data.startswith(q) for q in status_queries):
-                        is_status_query = True
-
-                if is_status_query:
-                    LAST_READ_BUFFER = get_live_hardware_status(printer_name, clean_data)
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self._send_cors_headers()
-                    self.end_headers()
-                    self.wfile.write(b'{}')
-                    return
-
-                print(f"[POST /write] Printopdracht ontvangen ({len(zpl_bytes)} bytes)", flush=True)
-
-                proc = subprocess.Popen(['lp', '-o', 'raw', '-d', printer_name], stdin=subprocess.PIPE)
-                proc.communicate(input=zpl_bytes)
-
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self._send_cors_headers()
-                self.end_headers()
-                self.wfile.write(b'{}')
-
-            elif path in ['/read', '/read/']:
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/plain')
-                self._send_cors_headers()
-                self.end_headers()
-                self.wfile.write(LAST_READ_BUFFER)
-
-            else:
-                self.send_response(404)
-                self.end_headers()
+            path = urllib.parse.urlparse(self.path).path.rstrip('/') or '/'
+            if path not in ['/write', '/read', '/']:
+                self._reply(404)
+                return
+            payload, raw = self._body()
+            if path == '/read':
+                self._read_status(payload)
+                return
+            printer = self._select_printer(payload)
+            if not printer:
+                self._reply(404, {'error': 'Printer not available'})
+                return
+            data = payload.get('data') if payload else raw
+            if isinstance(data, str):
+                data = data.encode('utf-8')
+            if not isinstance(data, bytes) or not data:
+                raise ValueError('Missing print data')
+            clean = data.strip()
+            if len(clean) < 100 and b'^XA' not in clean and any(
+                    clean.startswith(q) for q in [b'~HQES', b'~HS', b'~HI', b'~HD']):
+                with READ_LOCK:
+                    READ_BUFFERS.pop(printer['uid'], None)
+                status = get_live_hardware_status(printer['name'], clean)
+                with READ_LOCK:
+                    READ_BUFFERS[printer['uid']] = status
+                self._reply(200, {})
+                return
+            # HTTP success means that CUPS accepted this job, not physical completion.
+            result = subprocess.run(['lp', '-o', 'raw', '-d', printer['name']], input=data,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+            if result.returncode != 0:
+                self._reply(503, {'error': 'CUPS rejected the print job'})
+                return
+            self._reply(200, {})
+        except subprocess.TimeoutExpired:
+            self._reply(504, {'error': 'CUPS did not respond in time'})
+        except (ValueError, TypeError):
+            self._reply(400, {'error': 'Invalid print request'})
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception:
-            try:
-                self.send_response(500)
-                self._send_cors_headers()
-                self.end_headers()
-            except Exception:
-                pass
+            self._reply(500, {'error': 'Print service failed'})
 
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     pass
